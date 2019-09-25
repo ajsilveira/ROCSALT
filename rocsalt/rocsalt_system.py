@@ -54,9 +54,9 @@ class RocsaltSystem(object):
         system : openmm.System 
         stucture : parmed.Structure
         ligands : list(Ligand)
-        dummies_to_ions_idx : list of int
+        dummies_to_ions_idx : list of int or None
             Indices of dummy atoms that will be transformed into counterions.
-        ions_to_dummies_idx : list of int
+        ions_to_dummies_idx : list of int or 0
             Indices of ions that will be transformed into dummies.
         receptor_end_idx : list of int
             Indices of first and last atom of receptor.
@@ -101,8 +101,11 @@ class RocsaltSystem(object):
             structure_indices += ligand_indices
             self.ligands.append(Ligand(resname, total_charge, 'off', ligand_indices))
 
-        # Determine counterions and dummy atoms required
-        counter_counterions, ions_to_dummies, dummies_to_ions = self._ions_and_dummies_required(*self.ligands)
+        # Determine counterions and dummy atoms required if ligands are charged
+        charges = [ligand.charge for ligand in self.ligands]
+        not_neutral = any(abs(charge) > 0.001 for charge in charges)
+        if not_neutral:
+            counter_counterions, ions_to_dummies, dummies_to_ions = self._ions_and_dummies_required(*self.ligands)
 
         kwargs = { 'nonbondedMethod' : app.PME, 'constraints' : app.HBonds, 'rigidWater' : True,
         'ewaldErrorTolerance' : 1.0e-4, 'removeCMMotion' : True, 'hydrogenMass' : 3.0*unit.amu }
@@ -110,21 +113,28 @@ class RocsaltSystem(object):
         receptor_charge = [(ion_id, yank.pipeline.compute_net_charge(system, [ion_id]))
                           for ion_id in receptor_ions_idx]
         # Determine indexes of dummies and ions/dummies that will be transformed along the alchemical protocol
-        dummies_idx = self._ions_subset(receptor_charge, counter_counterions)
+        if counter_counterions:
+            dummies_idx = self._ions_subset(receptor_charge, counter_counterions)
 
         # dummies_to_ions_idx: subset of dummies_idx
-        if (dummies_to_ions):
+        if dummies_to_ions:
             self.dummies_to_ions_idx = dummies_idx[:abs(dummies_to_ions)]
             to_dummies_idx = list(set(dummies_idx) - set(self.dummies_to_ions_idx))
         else:
             self.dummies_to_ions_idx = None
-            to_dummies_idx = dummies_idx        
-        self.ions_to_dummies_idx = self._ions_subset(receptor_charge, ions_to_dummies)
-        # Modify OpenMM system to transform ions into dummies
-        for force in system.getForces():
-            if force.__class__.__name__ == 'NonbondedForce':
-                for index in to_dummies_idx:
-                    force.setParticleParameters(index, 0.0, 1.0, 0.0)
+            to_dummies_idx = dummies_idx
+
+        if np.abs(ions_to_dummies) > 0.001:
+            self.ions_to_dummies_idx = self._ions_subset(receptor_charge, ions_to_dummies)
+        else:
+           self.ions_to_dummies_idx = None
+
+        if to_dummies_idx:
+            # Modify OpenMM system to transform ions into dummies
+            for force in system.getForces():
+                if force.__class__.__name__ == 'NonbondedForce':
+                    for index in to_dummies_idx:
+                        force.setParticleParameters(index, 0.0, 1.0, 0.0)
 
         positions = self._anneal_ligand(receptor_idx) 
         pos_value = positions.value_in_unit(unit.angstroms)
@@ -319,7 +329,7 @@ class RocsaltSystem(object):
                 Total charge to be zeroed after adding ligands.
             ions_to_dummies : int
                 Total charge to be zeroed in the alchemical protocol. 
-            dummies_to_ions : int
+            dummies_to_ions : int or None
                 Total charge to be created in the alchemical protocol.
         """
 
@@ -332,19 +342,22 @@ class RocsaltSystem(object):
             ligand_1.state = 'on'
             den = ligand_0.charge
 
-        ions_to_dummies = None
-        dummies_to_ions = None
+        counter_counterions = int(num)
+        if abs(den) > 0.0001: 
+            if (num/den) >= 1:
+                ions_to_dummies = int(den - num)
+                dummies_to_ions = None
+            elif num == -den:
+                ions_to_dummies = int(-num)
+                dummies_to_ions = int(num)
+            else:
+                ions_to_dummies = int(-num)
+                dummies_to_ions = int(den)
 
-        counter_counterions = num
-        if (num/den) >= 1:
-            ions_to_dummies = den - num
-        elif num == -den:
-            ions_to_dummies = -num
-            dummies_to_ions = num
-        elif (num/den) < -1:
-            ions_to_dummies = -num
-            dummies_to_ions = den
-        
+        else:
+            ions_to_dummies = int(-num)
+            dummies_to_ions = None
+
         return counter_counterions, ions_to_dummies, dummies_to_ions
 
     def _alchemically_modify_ligand(self, reference_system):
@@ -431,25 +444,27 @@ class RocsaltSystem(object):
 
         return sampler_state.positions
 
-class EditYaml(object):
-    """
-    Edits a Yank yaml configuration file for running a Rocsalt simulation.
-    """
+    def _create_yaml(self):
+        """
+        Creates a Yank yaml configuration file
+        """
         
-    def __init__(self, ligands, dummies_to_ions_idx, ions_to_dummies_idx, receptor_end_idx):
- 
         file_name = 'rocsalt_system.yaml'
         config, ind, bsi = ruamel.yaml.util.load_yaml_guess_indent(open(file_name))
         instances_system = config['systems']
         instances_experiment = config['experiment']
 
-        for ligand in ligands:
+        for ligand in self.ligands:
             index = 'zero' if ligand.state == 'on' else 'one'
             instances_system['relative-system'][f'ligand_{index}'] = copy.deepcopy(ligand.indices)
             instances_experiment['ligands-restraint'][f'restrained_ligand_{index}_atoms'] = copy.deepcopy(ligand.indices)
-        instances_system['relative-system']['ions_one'] = ions_to_dummies_idx
-        instances_system['relative-system']['ions_zero'] = dummies_to_ions_idx
-        instances_experiment['restraint']['restrained_receptor_atoms'] = '[index for index in range(receptor_end_idx[0], receptor_end_idx[1])]'
+        if self.ions_to_dummies_idx:
+            instances_system['relative-system']['ions_one'] = self.ions_to_dummies_idx
+        if self.dummies_to_ions_idx:
+            instances_system['relative-system']['ions_zero'] = self.dummies_to_ions_idx
+        first = self.receptor_end_idx[0]
+        last = self.receptor_end_idx[1]
+        instances_experiment['restraint']['restrained_receptor_atoms'] = f'[index for index in range({first}, {last})]'
         instances_experiment['restraint']['restrained_ligand_atoms'] = copy.deepcopy(ligand.indices)       
         with open(file_name, 'w') as fp:
             ruamel.yaml.round_trip_dump(config, fp,  default_flow_style=True )
@@ -512,7 +527,7 @@ def main():
         pickle.dump(rocsalt.structure, file)
 
     # Edit yaml file
-    EditYaml(rocsalt.ligands, rocsalt.dummies_to_ions_idx, rocsalt.ions_to_dummies_idx, rocsalt.receptor_end_idx)
+    rocsalt._create_yaml()
 
 if __name__ == "__main__":
 
