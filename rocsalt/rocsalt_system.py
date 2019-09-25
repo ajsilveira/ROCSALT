@@ -46,7 +46,7 @@ class RocsaltSystem(object):
             Mol2 file of ligand 1.
         ligand_1_file : str
             Mol2 file of ligand 2.
-         receptor_files : list of str
+        receptor_file1 [, receptor_file2] : str
             Prmtop/inpcrd or pdb files of receptor.
 
     Properties
