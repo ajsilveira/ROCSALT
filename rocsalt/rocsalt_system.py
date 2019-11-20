@@ -84,7 +84,7 @@ class RocsaltSystem(object):
         # Determine which ions are present
         receptor_ions, receptor_ions_idx = self._ions_in_receptor(self.structure.topology)
         # Determine indexes of receptor atoms
-        receptor_idx = list(set(structure_indices) - set(md.Topology.from_openmm(self.structure.topology).select('not water').tolist() + receptor_ions_idx))
+        receptor_idx = list(set(structure_indices) - set(md.Topology.from_openmm(self.structure.topology).select('water').tolist() + receptor_ions_idx))
         # first and last index in receptor_idx
         self.receptor_end_idx = [receptor_idx[0], receptor_idx[-1]]
 
@@ -108,7 +108,7 @@ class RocsaltSystem(object):
             counter_counterions, ions_to_dummies, dummies_to_ions = self._ions_and_dummies_required(*self.ligands)
 
         kwargs = { 'nonbondedMethod' : app.PME, 'constraints' : app.HBonds, 'rigidWater' : True,
-        'ewaldErrorTolerance' : 1.0e-4, 'removeCMMotion' : True, 'hydrogenMass' : 3.0*unit.amu }
+        'ewaldErrorTolerance' : 1.0e-4, 'removeCMMotion' : True, 'hydrogenMass' : 3.0*unit.amu, , 'nonbondedCutoff' : 1*unit.nanometer }
         self.system = self.structure.createSystem(**kwargs)
         receptor_charge = [(ion_id, yank.pipeline.compute_net_charge(system, [ion_id]))
                           for ion_id in receptor_ions_idx]
@@ -131,7 +131,7 @@ class RocsaltSystem(object):
 
         if to_dummies_idx:
             # Modify OpenMM system to transform ions into dummies
-            for force in system.getForces():
+            for force in self.system.getForces():
                 if force.__class__.__name__ == 'NonbondedForce':
                     for index in to_dummies_idx:
                         force.setParticleParameters(index, 0.0, 1.0, 0.0)
@@ -222,14 +222,14 @@ class RocsaltSystem(object):
         forcefield = app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
         system = forcefield.createSystem(pdb.topology, **kwargs)
         for i in range(system.getNumForces()):
-            if isinstance(system.getForce(i), NonbondedForce):
+            if isinstance(system.getForce(i), openmm.NonbondedForce):
                 nonbonded = system.getForce(i)
                 break
 
         total_charge = 0.0
         for i in range(nonbonded.getNumParticles()):
             nb_i = nonbonded.getParticleParameters(i)
-            total_charge += nb_i[0].value_in_unit(elementary_charge)
+            total_charge += nb_i[0].value_in_unit(unit.elementary_charge)
         total_charge = int(floor(0.5 + total_charge))
 
         return self._fix_particle_sigmas(system), pdb.topology, pdb.positions, total_charge
@@ -370,7 +370,7 @@ class RocsaltSystem(object):
         """
 
         from openmmtools.alchemy import AbsoluteAlchemicalFactory, AlchemicalRegion, AlchemicalState
-        factory = openmmtools.alchemy.AbsoluteAlchemicalFactory(consistent_exceptions=False, split_alchemical_forces = True)
+        factory = openmmtools.alchemy.AbsoluteAlchemicalFactory(consistent_exceptions=False, split_alchemical_forces = True, alchemical_pme_treatment='exact')
         for ligand in self.ligands:
             if ligand.state == 'on':
                 alchemical_region_zero = openmmtools.alchemy.AlchemicalRegion(alchemical_atoms=ligand.indices, name='zero')
@@ -457,7 +457,7 @@ class RocsaltSystem(object):
         for ligand in self.ligands:
             index = 'zero' if ligand.state == 'on' else 'one'
             instances_system['relative-system'][f'ligand_{index}'] = copy.deepcopy(ligand.indices)
-            instances_experiment['ligands-restraint'][f'restrained_ligand_{index}_atoms'] = copy.deepcopy(ligand.indices)
+            instances_experiment['restraint'][f'restrained_ligand_{index}_atoms'] = copy.deepcopy(ligand.indices)
         if self.ions_to_dummies_idx:
             instances_system['relative-system']['ions_one'] = self.ions_to_dummies_idx
         if self.dummies_to_ions_idx:
