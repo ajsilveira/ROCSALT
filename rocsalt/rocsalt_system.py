@@ -9,6 +9,7 @@ import os
 import copy
 import time
 import yaml
+import shutil  
 import pickle
 import pathlib
 import argparse
@@ -91,15 +92,16 @@ class RocsaltSystem(object):
         self.ligands = []
         for index, file in enumerate([ligand_1_file, ligand_2_file]):
             name, ext = utils.parse_ligand_filename(file)
-            self._generate_amber_files(name, file)
-            prm = pmd.amber.AmberParm('data/' + name + '.prmtop')
+            prmtop_file, inpcrd_file = self._generate_amber_files(name, file)
+            prm = pmd.amber.AmberParm(prmtop_file)
             total_charge = int(floor(0.5 + pmd.tools.netCharge(prm).execute()))
-            resname = self._get_ligand_resname('data/' + name + '.prmtop')
+            resname = self._get_ligand_resname(prmtop_file)
             # add ligand to structure
-            self.structure += pmd.load_file('data/' + name + '.prmtop', xyz='data/' + name + '.inpcrd')
+            self.structure += pmd.load_file(prmtop_file, xyz=inpcrd_file)
             ligand_indices = list(set( md.Topology.from_openmm(self.structure.topology).select('all').tolist()) - set(structure_indices))
             structure_indices += ligand_indices
-            self.ligands.append(Ligand(resname, total_charge, 'off', ligand_indices))
+            print(sorted(ligand_indices))
+            self.ligands.append(Ligand(resname, total_charge, 'off', sorted(ligand_indices)))
 
         # Determine counterions and dummy atoms required if ligands are charged
         charges = [ligand.charge for ligand in self.ligands]
@@ -108,7 +110,7 @@ class RocsaltSystem(object):
             counter_counterions, ions_to_dummies, dummies_to_ions = self._ions_and_dummies_required(*self.ligands)
 
         kwargs = { 'nonbondedMethod' : app.PME, 'constraints' : app.HBonds, 'rigidWater' : True,
-        'ewaldErrorTolerance' : 1.0e-4, 'removeCMMotion' : True, 'hydrogenMass' : 3.0*unit.amu, , 'nonbondedCutoff' : 1*unit.nanometer }
+        'ewaldErrorTolerance' : 1.0e-4, 'removeCMMotion' : True, 'hydrogenMass' : 3.0*unit.amu, 'nonbondedCutoff' : 1*unit.nanometer }
         self.system = self.structure.createSystem(**kwargs)
         receptor_charge = [(ion_id, yank.pipeline.compute_net_charge(system, [ion_id]))
                           for ion_id in receptor_ions_idx]
@@ -158,9 +160,21 @@ class RocsaltSystem(object):
             inpcrd_filename : str
                 Amber inpcrd file produced by tleap.
         """
-        gaff_mol2_filename1, frcmod_filename1 = amber.run_antechamber('data/' + ligand_name, file, charge_method=None)
-        return amber.run_tleap(ligand_name, gaff_mol2_filename1, frcmod_filename1, 'data/' + ligand_name + '.prmtop', 'data/' + ligand_name + '.inpcrd')
-
+        gaff_mol2_filename1, frcmod_filename1 = amber.run_antechamber(ligand_name, file, charge_method=None)
+        source_mol2 = os.path.abspath(gaff_mol2_filename1)
+        source_frcmod = os.path.abspath(frcmod_filename1)
+        destination = os.path.abspath('data/')
+        shutil.move(source_mol2, os.path.join(destination, os.path.basename(source_mol2)))
+        shutil.move(source_frcmod, os.path.join(destination, os.path.basename(source_frcmod)))
+        amber.run_tleap(ligand_name, os.path.join(destination, os.path.basename(source_mol2)), 
+                                     os.path.join(destination, os.path.basename(source_frcmod)),
+                                     ligand_name + '.prmtop', ligand_name + '.inpcrd')
+        source_prmtop = os.path.abspath(ligand_name + '.prmtop')
+        source_inpcrd = os.path.abspath(ligand_name + '.inpcrd')
+        shutil.move(source_prmtop, os.path.join(destination, os.path.basename(source_prmtop)))
+        shutil.move(source_inpcrd, os.path.join(destination, os.path.basename(source_inpcrd)))
+ 
+        return os.path.join(destination, os.path.basename(source_prmtop)), os.path.join(destination, os.path.basename(source_inpcrd))
     def _fix_particle_sigmas(self, system):
         """
         Fix particles with zero LJ sigma
@@ -453,19 +467,14 @@ class RocsaltSystem(object):
         config, ind, bsi = ruamel.yaml.util.load_yaml_guess_indent(open(file_name))
         instances_system = config['systems']
         instances_experiment = config['experiment']
-
+        idx = [[],[]]
         for ligand in self.ligands:
-            index = 'zero' if ligand.state == 'on' else 'one'
-            instances_system['relative-system'][f'ligand_{index}'] = copy.deepcopy(ligand.indices)
-            instances_experiment['restraint'][f'restrained_ligand_{index}_atoms'] = copy.deepcopy(ligand.indices)
-        if self.ions_to_dummies_idx:
-            instances_system['relative-system']['ions_one'] = self.ions_to_dummies_idx
-        if self.dummies_to_ions_idx:
-            instances_system['relative-system']['ions_zero'] = self.dummies_to_ions_idx
-        first = self.receptor_end_idx[0]
-        last = self.receptor_end_idx[1]
-        instances_experiment['restraint']['restrained_receptor_atoms'] = f'[index for index in range({first}, {last})]'
-        instances_experiment['restraint']['restrained_ligand_atoms'] = copy.deepcopy(ligand.indices)       
+            if ligand.state == 'on':
+                idx[0] = 'index ' + str(ligand.indices[0]) + ' to ' +  str(ligand.indices[-1])
+            else:
+                idx[1] = 'index ' + str(ligand.indices[0]) + ' to ' +  str(ligand.indices[-1])
+        instances_system['relative-system'][f'ligand_dsl'] = [copy.deepcopy(idx)]
+        instances_experiment['restraint'][f'restrained_ligand_atoms'] = [copy.deepcopy(idx)]
         with open(file_name, 'w') as fp:
             ruamel.yaml.round_trip_dump(config, fp,  default_flow_style=True )
 
