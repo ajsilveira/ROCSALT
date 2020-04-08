@@ -97,9 +97,6 @@ class RocsaltSystem(object):
         # Assign arbitrary resnames
         resnames = ['l1', 'l2']
 
-        states = ['on', 'off'] # the states of the ligands in the alchemical protocol
-                               #  will be determined by the order in which the files are passed.
-                               # first ligand will be fully interacting at the beginning of the protocol
         for index, file in enumerate([ligand_1_file, ligand_2_file]):
             prmtop_file, inpcrd_file = self._ligand_amber_files(resnames[index],
                                                                     file)
@@ -111,7 +108,7 @@ class RocsaltSystem(object):
             lig_idx = md.Topology.from_openmm(complex_top).select(lig_res).tolist()
             # properties carried by each ligand
             self.ligands.append(_Ligand(resnames[index], total_charge,
-                                states[index], sorted(lig_idx)))
+                                 sorted(lig_idx)))
 
         # Create solvent box containing the ligands and counterions
         prmtop_file, inpcrd_file = self._solvent_amber_files(f'{resnames[0]}',
@@ -129,37 +126,58 @@ class RocsaltSystem(object):
                                                   xyz=f'data/{resnames[1]}.inpcrd')
 
         for index, phase in enumerate(['complex', 'solvent']):
-            self.phases[index].system = self.phases[0].create_system()
-            ions, ions_idx = self.phases[index].ions(self.phases[index].structure.topology)
-            ignore = ions_idx + self.ligands[0].indices + self.ligands[1].indices
-            net_charge = self.phases[index].net_charge(self.phases[index].system, ignore)
-            self.phases[index].ions = [(ion_id,
-                                      yank.pipeline.compute_net_charge(self.phases[index].system,
-                                      [ion_id])) for ion_id in ions_idx]
-            charge_init = net_charge + self.ligands[0].charge
-            charge_end = net_charge + self.ligands[1].charge
-            # Determine counterions, ions and dummies that will be part of the alchemical protocol
-            counterions, ions_to_dummies, dummies_to_ions = self.phases[index].ions_and_dummies(charge_init,
-                                                                                   charge_end)
-            counterions_idx = self.phases[index].ions_subset(self.phases[index].ions, counterions)
+            system = self.phases[index].create_system()
+            mdtraj_topo = md.Topology.from_openmm(self.phases[index].structure.topology)
+            lig1_idx = mdtraj_topo.select(f'resname {self.ligands[0].name}').tolist()
+            lig2_idx = mdtraj_topo.select(f'resname {self.ligands[1].name}').tolist()
+            ions_atoms = self.phases[index].ions_atoms(self.phases[index].structure.topology)
+            ions_net_charges = [(ion_id, yank.pipeline.compute_net_charge(system, [ion_id]))
+                                for ion_id in ions_atoms]
+            ignore = [ions[0] for ions in ions_net_charges] + lig1_idx + lig2_idx
+            indices = [atom.index for atom in mdtraj_topo.atoms if atom.index not in ignore]
+            net_charge = yank.pipeline.compute_net_charge(system, indices)
+            charge_init = net_charge + yank.pipeline.compute_net_charge(system, lig1_idx)
+            charge_end = net_charge + yank.pipeline.compute_net_charge(system, lig2_idx)
+            if (charge_init*charge_end) > 0:
+                if abs(charge_init) > abs(charge_end):
+                    ions_to_dummies = int(charge_end - charge_init)
+                    dummies_to_ions = None
+                elif abs(charge_init) < abs(charge_end):
+                    ions_to_dummies = None
+                    dummies_to_ions = int(-(charge_end - charge_init))
+                else:
+                    ions_to_dummies = None
+                    dummies_to_ions = None
+            else:
+                ions_to_dummies = int(-charge_init)
+                dummies_to_ions = int(-charge_end)
+
+            counterions = yank.pipeline.ions_subset(ions_net_charges, -charge_init)
+            avail_ions = [id for id in ions_net_charges if id not in counterions]
+            ions_to_dummies_idx = None
+            dummies_to_ions_idx = None
+            if ions_to_dummies:
+                ions_to_dummies_idx = counterions[:abs(ions_to_dummies)]
+            if dummies_to_ions:
+                dummies_to_ions_idx = ions_subset(avail_ions, dummies_to_ions)
+
             keep_ions = []
             if ions_to_dummies:
-                self.phases[index].ions_to_dummies_idx = counterions_idx[:abs(ions_to_dummies)]
+                self.phases[index].ions_to_dummies_idx = counterions[:abs(ions_to_dummies)]
                 keep_ions.append(self.phases[index].ions_to_dummies_idx)
-            avail_ions = [(id, c) for (id, c) in self.phases[index].ions if id not in counterions_idx]
             if dummies_to_ions:
-                self.phases[index].dummies_to_ions_idx = self.phases[index].ions_subset(avail_ions,
+                self.phases[index].dummies_to_ions_idx = self.phases[index].yank.pipeline.ions_subset(avail_ions,
                                                                           dummies_to_ions)
                 keep_ions.append(self.phases[index].dummies_to_ions_idx)
-            # Modify OpenMM system to transform ions (not used in the alchemical protocol) into dummies
-            keep_ions += counterions_idx
-            self.phases[index].to_dummies_idx = [id for (id, c) in self.phases[index].ions
-                                                                 if id not in [keep_ions]]
-            for force in self.phases[index].system.getForces():
-                if force.__class__.__name__ == 'NonbondedForce':
-                    for index in self.phases[index].to_dummies_idx:
-                        force.setParticleParameters(index, 0.0, 1.0, 0.0)
-
+            keep_ions += counterions
+            self.phases[index].to_dummies_idx = [id for id in ions_atoms if id not in keep_ions]
+            amber_mask = '@' + ', '.join(str(x + 1) for x in self.phases[index].to_dummies_idx)
+            self.phases[index].structure.strip(amber_mask)
+            new_mdtraj_topo = md.Topology.from_openmm(self.phases[index].structure.topology)
+            self.phases[index].system = self.phases[index].create_system()
+            self.phases[index].lig1_idx = new_mdtraj_topo.select(f'resname {self.ligands[0].name}').tolist()
+            self.phases[index].lig2_idx = new_mdtraj_topo.select(f'resname {self.ligands[1].name}').tolist()
+        
         # anneal complex phase to avoid clashes
         positions = self._anneal_ligand(self.phases[0].structure)
         pos_value = positions.value_in_unit(unit.angstroms)
@@ -374,12 +392,10 @@ class RocsaltSystem(object):
         from openmmtools.alchemy import AbsoluteAlchemicalFactory, AlchemicalRegion, AlchemicalState
         factory = mmtools.alchemy.AbsoluteAlchemicalFactory(alchemical_pme_treatment='exact',
                                                            disable_alchemical_dispersion_correction=True)
-        for ligand in self.ligands:
-            if ligand.state == 'on':
-                region_zero = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=ligand.indices,
+
+        region_zero = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lig1_idx ,
                                                                name='zero')
-            else:
-                region_one = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=ligand.indices,
+        region_one = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lig2_idx ,
                                                               name='one')
 
         alchemical_system = factory.create_alchemical_system(reference_system,
@@ -404,8 +420,8 @@ class RocsaltSystem(object):
         guests_restraints = openmm.CustomCentroidBondForce(2, "(k/2)*distance(g1,g2)^2")
         guests_restraints.addGlobalParameter('k',
                                              100.0*unit.kilocalories_per_mole/unit.angstrom**2)
-        guests_restraints.addGroup(self.ligands[0].indices)
-        guests_restraints.addGroup(self.ligands[1].indices)
+        guests_restraints.addGroup(self.phases[0].lig1_idx )
+        guests_restraints.addGroup(self.phases[0].lig2_idx )
         guests_restraints.addBond([0,1], [])
         reference_system.addForce(guests_restraints)
 
@@ -481,20 +497,14 @@ class _Ligand(object):
                 Resname.
             charge : int
                 Total charge.
-            state : str
-               State at the beginning of the alchemical protocol.
             indices : list of int
                 Indices of atoms of the ligand in the rocsalt.structure
 
     """
-    def __init__(self, name, charge, state, indices):
+    def __init__(self, name, charge, indices):
         self.name = name
         self.charge = charge
         self.indices = indices
-        self.set_state(state)
-
-    def set_state(self, state):
-        self.state = state
 
     def generate_amber_files(self, ligand_name, file):
         """
@@ -553,45 +563,7 @@ class _Phase(object):
         'nonbondedCutoff' : 1*unit.nanometer }
         return self.structure.createSystem(**kwargs)
 
-    def net_charge(self, system, ions):
-
-        for i in range(system.getNumForces()):
-            if isinstance(system.getForce(i), openmm.NonbondedForce):
-                nonbonded = system.getForce(i)
-                break
-
-        total_charge = 0.0
-        for i in range(nonbonded.getNumParticles()):
-            if i not in ions:
-                nb_i = nonbonded.getParticleParameters(i)
-                total_charge += nb_i[0].value_in_unit(unit.elementary_charge)
-        total_charge = int(floor(0.5 + total_charge))
-        return total_charge
-
-    def ions_subset(self, ions_net_charges, counterions):
-        """
-	Finds minimal subset of ion indexes whose charge sums to counterions
-            Parameters
-            ----------
-                ions_net_charges : list of tuples
-                    (index, charge) of ions in system.
-                counterions : int
-                    Total charge.
-
-             Returns
-             -------
-                counterions_indices : list of int
-                    Indices of ions.
-
-        """
-
-        for n_ions in range(1, len(ions_net_charges) + 1):
-            for ion_subset in itertools.combinations(ions_net_charges, n_ions):
-                counterions_indices, counterions_charges = zip(*ion_subset)
-                if sum(counterions_charges) == counterions:
-                    return(counterions_indices)
-
-    def ions(self, topology):
+    def ions_atoms(self, topology):
         """
         Determines resnames and indexes of ions.
         The supported species are sodium, chlorine and potassium.
@@ -609,50 +581,11 @@ class _Phase(object):
 
         ION_RESIDUE_NAMES = {'NA', 'CL', 'K'}
         ions = []
-        ions_idx = []
         for res in topology.residues():
             if (('-' in res.name) or ('+' in res.name) or (res.name in ION_RESIDUE_NAMES)):
-                ions.append(res.name)
-                ions_idx += [atom.index for atom in res.atoms()]
+                ions += [atom.index for atom in res.atoms()]
 
-        return ions, ions_idx
-
-    def ions_and_dummies(self, charge_init, charge_end):
-        """
-        Sets which ligand will have full interactions in the initial state of the alchemical protocol.
-        Determines total charges to be zeroed after adding the ligands, along the alchemical
-        protocol and to be created along the alchemical protocol.
-        Parameters
-        ----------
-            ligand_0 : (Ligand)
-            ligand_1 : (Ligand)
-        Returns
-        -------
-            counterions : int
-                Total charge to be zeroed after adding ligands.
-            ions_to_dummies : int
-                Total charge to be zeroed in the alchemical protocol.
-            dummies_to_ions : int or None
-                Total charge to be created in the alchemical protocol.
-        """
-
-        counterions = int(-charge_init)
-
-        if (charge_init*charge_end) > 0:
-            if abs(charge_init) > abs(charge_end):
-                ions_to_dummies = int(charge_end - charge_init)
-                dummies_to_ions = None
-            elif abs(charge_init) < abs(charge_end):
-                ions_to_dummies = None
-                dummies_to_ions = int(-(charge_end - charge_init))
-            else:
-                ions_to_dummies = None
-                dummies_to_ions = None
-        else:
-            ions_to_dummies = int(-charge_init)
-            dummies_to_ions = int(-charge_end)
-
-        return counterions, ions_to_dummies, dummies_to_ions
+        return ions
 
 
 def main():
@@ -681,7 +614,7 @@ def main():
          f.write(XmlSerializer.serialize(rocsalt.phases[1].system))
     # Write pdb
     rocsalt.phases[0].structure.write_pdb('complex_phase.pdb')
-    rocsalt.phases[0].structure.write_pdb('solvent_phase.pdb')
+    rocsalt.phases[1].structure.write_pdb('solvent_phase.pdb')
 
     # Serialize ParmEd structure
     with open('complex_structure.pickle', 'wb') as file:
