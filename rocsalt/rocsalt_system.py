@@ -177,12 +177,12 @@ class RocsaltSystem(object):
             self.phases[index].lg1_idx = self.phases[index].mdtraj_top.select(f'resname {self.ligands[0].name}').tolist()
             self.phases[index].lg2_idx = self.phases[index].mdtraj_top.select(f'resname {self.ligands[1].name}').tolist()
         
-        # anneal complex phase to avoid clashes
-        positions = self._anneal_ligand(self.phases[0].structure)
-        pos_value = positions.value_in_unit(unit.angstroms)
-        coords = np.array(list(pos_value), dtype=np.float64)
-        natoms = len(self.phases[0].structure.atoms)
-        self.phases[0].structure.coordinates = coords.reshape((-1, natoms, 3))
+            # anneal phases to avoid clashes
+            positions = self._anneal_ligand(self.phases[index].structure, index)
+            pos_value = positions.value_in_unit(unit.angstroms)
+            coords = np.array(list(pos_value), dtype=np.float64)
+            natoms = len(self.phases[index].structure.atoms)
+            self.phases[index].structure.coordinates = coords.reshape((-1, natoms, 3))
 
     def _get_ligand_resname(self, filename):
         """
@@ -379,7 +379,7 @@ class RocsaltSystem(object):
         return prmtop_filename, inpcrd_filename
 
 
-    def _alchemically_modify_ligand(self, reference_system):
+    def _alchemically_modify_ligand(self, reference_system, index):
         """
         Creates an alchemical system.
         Returns
@@ -392,9 +392,9 @@ class RocsaltSystem(object):
         factory = mmtools.alchemy.AbsoluteAlchemicalFactory(alchemical_pme_treatment='exact',
                                                            disable_alchemical_dispersion_correction=True)
 
-        region_zero = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lg1_idx ,
+        region_zero = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[index].lg1_idx ,
                                                                name='zero')
-        region_one = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lg2_idx ,
+        region_one = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[index].lg2_idx ,
                                                               name='one')
 
         alchemical_system = factory.create_alchemical_system(reference_system,
@@ -402,7 +402,7 @@ class RocsaltSystem(object):
 
         return alchemical_system
 
-    def _anneal_ligand(self, structure):
+    def _anneal_ligand(self, structure, index):
         """
         Anneal ligand interactions to clean up clashes.
         Returns
@@ -411,11 +411,11 @@ class RocsaltSystem(object):
                 Positions of all atoms after annealing the ligand
         """
 
-        reference_system = copy.deepcopy(self.phases[0].system)
-        protein = self.phases[0].mdtraj_top.select(f'protein and backbone and type CA').tolist()
-        rmsd = openmm.RMSDForce(self.phases[0].structure.positions, protein + 
-                                                                    self.phases[0].lg1_idx + 
-                                                                    self.phases[0].lg2_idx)
+        reference_system = copy.deepcopy(self.phases[index].system)
+        protein = self.phases[index].mdtraj_top.select(f'protein and backbone and type CA').tolist()
+        rmsd = openmm.RMSDForce(self.phases[index].structure.positions, protein + 
+                                                                    self.phases[index].lg1_idx + 
+                                                                    self.phases[index].lg2_idx)
         energy_expression = 'step(dRMSD) * (K_RMSD/2)*dRMSD^2; dRMSD = (RMSD-RMSD0);'
         restraint_force = openmm.CustomCVForce(energy_expression)
         restraint_force.addCollectiveVariable('RMSD', rmsd)
@@ -423,7 +423,7 @@ class RocsaltSystem(object):
         restraint_force.addGlobalParameter('RMSD0', 2*unit.angstroms)
         reference_system.addForce(restraint_force)
 
-        alchemical_system = self._alchemically_modify_ligand(reference_system)
+        alchemical_system = self._alchemically_modify_ligand(reference_system, index)
 
         from openmmtools.alchemy import AlchemicalState
         alchemical_state_zero = mmtools.alchemy.AlchemicalState.from_system(alchemical_system,
@@ -608,17 +608,17 @@ def main():
     with open('solvent_system.xml', 'w') as f:
          f.write(XmlSerializer.serialize(rocsalt.phases[1].system))
     # Write pdb
-    coords = rocsalt.phases[0].structure.get_coordinates(frame=0)*unit.angstroms
-    xyz = np.zeros(shape=(1,coords.shape[0],3))
-    xyz[0,:,:] = coords.in_units_of(unit.nanometers)/unit.nanometers
-    cell_size = [rocsalt.phases[0].structure.box[i]*unit.angstroms for i in range(3)]
-    cell_angles = [rocsalt.phases[0].structure.box[i] for i in range(3,6)]
-    t = md.Trajectory(xyz, topology=rocsalt.phases[0].mdtraj_top, 
-                      unitcell_lengths=np.asarray([l.in_units_of(unit.nanometers)/unit.nanometers for l in cell_size]), 
-                      unitcell_angles=np.asarray([a for a in cell_angles]))
-    t.image_molecules(inplace=True)
-    t.save_pdb('complex_phase.pdb')
-    rocsalt.phases[1].structure.write_pdb('solvent_phase.pdb')
+    for index, phase in enumerate(['complex, solvent']):
+        coords = rocsalt.phases[index].structure.get_coordinates(frame=0)*unit.angstroms
+        xyz = np.zeros(shape=(1,coords.shape[0],3))
+        xyz[0,:,:] = coords.in_units_of(unit.nanometers)/unit.nanometers
+        cell_size = [rocsalt.phases[index].structure.box[i]*unit.angstroms for i in range(3)]
+        cell_angles = [rocsalt.phases[index].structure.box[i] for i in range(3, 6)]
+        t = md.Trajectory(xyz, topology=rocsalt.phases[index].mdtraj_top, 
+                          unitcell_lengths=np.asarray([l.in_units_of(unit.nanometers)/unit.nanometers for l in cell_size]), 
+                          unitcell_angles=np.asarray([a for a in cell_angles]))
+        t.image_molecules(inplace=True)
+        t.save_pdb(f'{phase}_phase.pdb')
 
     # Serialize ParmEd structure
     with open('complex_structure.pickle', 'wb') as file:
