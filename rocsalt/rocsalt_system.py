@@ -95,18 +95,17 @@ class RocsaltSystem(object):
             os.mkdir('data')
 
         # Assign arbitrary resnames
-        resnames = ['l1', 'l2']
+        resnames = ['lg1', 'lg2']
 
         for index, file in enumerate([ligand_1_file, ligand_2_file]):
-            prmtop_file, inpcrd_file = self._ligand_amber_files(resnames[index],
-                                                                    file)
+            prmtop_file, inpcrd_file = self._ligand_amber_files(resnames[index], file)
             prm = pmd.amber.AmberParm(prmtop_file)
             total_charge = int(floor(0.5 + pmd.tools.netCharge(prm).execute()))
             self.phases[0].structure += pmd.load_file(prmtop_file, xyz=inpcrd_file)
             complex_top = self.phases[0].structure.topology
             lig_res = f'resname {resnames[index]}'
             lig_idx = md.Topology.from_openmm(complex_top).select(lig_res).tolist()
-            # properties carried by each ligand
+            # properties of each ligand
             self.ligands.append(_Ligand(resnames[index], total_charge,
                                  sorted(lig_idx)))
 
@@ -127,17 +126,17 @@ class RocsaltSystem(object):
 
         for index, phase in enumerate(['complex', 'solvent']):
             system = self.phases[index].create_system()
-            mdtraj_topo = md.Topology.from_openmm(self.phases[index].structure.topology)
-            lig1_idx = mdtraj_topo.select(f'resname {self.ligands[0].name}').tolist()
-            lig2_idx = mdtraj_topo.select(f'resname {self.ligands[1].name}').tolist()
+            mdtraj_top = md.Topology.from_openmm(self.phases[index].structure.topology)
+            lg1_idx = mdtraj_top.select(f'resname {self.ligands[0].name}').tolist()
+            lg2_idx = mdtraj_top.select(f'resname {self.ligands[1].name}').tolist()
             ions_atoms = self.phases[index].ions_atoms(self.phases[index].structure.topology)
             ions_net_charges = [(ion_id, yank.pipeline.compute_net_charge(system, [ion_id]))
                                 for ion_id in ions_atoms]
-            ignore = [ions[0] for ions in ions_net_charges] + lig1_idx + lig2_idx
-            indices = [atom.index for atom in mdtraj_topo.atoms if atom.index not in ignore]
+            ignore = [ions[0] for ions in ions_net_charges] + lg1_idx + lg2_idx
+            indices = [atom.index for atom in mdtraj_top.atoms if atom.index not in ignore]
             net_charge = yank.pipeline.compute_net_charge(system, indices)
-            charge_init = net_charge + yank.pipeline.compute_net_charge(system, lig1_idx)
-            charge_end = net_charge + yank.pipeline.compute_net_charge(system, lig2_idx)
+            charge_init = net_charge + yank.pipeline.compute_net_charge(system, lg1_idx)
+            charge_end = net_charge + yank.pipeline.compute_net_charge(system, lg2_idx)
             if (charge_init*charge_end) > 0:
                 if abs(charge_init) > abs(charge_end):
                     ions_to_dummies = int(charge_end - charge_init)
@@ -173,10 +172,10 @@ class RocsaltSystem(object):
             self.phases[index].to_dummies_idx = [id for id in ions_atoms if id not in keep_ions]
             amber_mask = '@' + ', '.join(str(x + 1) for x in self.phases[index].to_dummies_idx)
             self.phases[index].structure.strip(amber_mask)
-            new_mdtraj_topo = md.Topology.from_openmm(self.phases[index].structure.topology)
+            self.phases[index].mdtraj_top = md.Topology.from_openmm(self.phases[index].structure.topology)
             self.phases[index].system = self.phases[index].create_system()
-            self.phases[index].lig1_idx = new_mdtraj_topo.select(f'resname {self.ligands[0].name}').tolist()
-            self.phases[index].lig2_idx = new_mdtraj_topo.select(f'resname {self.ligands[1].name}').tolist()
+            self.phases[index].lg1_idx = self.phases[index].mdtraj_top.select(f'resname {self.ligands[0].name}').tolist()
+            self.phases[index].lg2_idx = self.phases[index].mdtraj_top.select(f'resname {self.ligands[1].name}').tolist()
         
         # anneal complex phase to avoid clashes
         positions = self._anneal_ligand(self.phases[0].structure)
@@ -311,7 +310,7 @@ class RocsaltSystem(object):
         gaff_mol2_filename1, frcmod_filename1 = amber.run_antechamber(ligand_name,
                                                                       file,
                                                                       resname=True,
-                                                                      charge_method=None)
+                                                                      charge_method='bcc')
         source_mol2 = os.path.abspath(gaff_mol2_filename1)
         source_frcmod = os.path.abspath(frcmod_filename1)
         destination = os.path.abspath('data')
@@ -393,17 +392,13 @@ class RocsaltSystem(object):
         factory = mmtools.alchemy.AbsoluteAlchemicalFactory(alchemical_pme_treatment='exact',
                                                            disable_alchemical_dispersion_correction=True)
 
-        region_zero = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lig1_idx ,
+        region_zero = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lg1_idx ,
                                                                name='zero')
-        region_one = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lig2_idx ,
+        region_one = mmtools.alchemy.AlchemicalRegion(alchemical_atoms=self.phases[0].lg2_idx ,
                                                               name='one')
 
         alchemical_system = factory.create_alchemical_system(reference_system,
                                                              alchemical_regions = [region_zero, region_one])
-        alchemical_state_zero = mmtools.alchemy.AlchemicalState.from_system(alchemical_system,
-                                                                            parameters_name_suffix = 'zero')
-        alchemical_state_one = mmtools.alchemy.AlchemicalState.from_system(alchemical_system,
-                                                                           parameters_name_suffix = 'one')
 
         return alchemical_system
 
@@ -417,13 +412,16 @@ class RocsaltSystem(object):
         """
 
         reference_system = copy.deepcopy(self.phases[0].system)
-        guests_restraints = openmm.CustomCentroidBondForce(2, "(k/2)*distance(g1,g2)^2")
-        guests_restraints.addGlobalParameter('k',
-                                             100.0*unit.kilocalories_per_mole/unit.angstrom**2)
-        guests_restraints.addGroup(self.phases[0].lig1_idx )
-        guests_restraints.addGroup(self.phases[0].lig2_idx )
-        guests_restraints.addBond([0,1], [])
-        reference_system.addForce(guests_restraints)
+        protein = self.phases[0].mdtraj_top.select(f'protein and backbone and type CA').tolist()
+        rmsd = openmm.RMSDForce(self.phases[0].structure.positions, protein + 
+                                                                    self.phases[0].lg1_idx + 
+                                                                    self.phases[0].lg2_idx)
+        energy_expression = 'step(dRMSD) * (K_RMSD/2)*dRMSD^2; dRMSD = (RMSD-RMSD0);'
+        restraint_force = openmm.CustomCVForce(energy_expression)
+        restraint_force.addCollectiveVariable('RMSD', rmsd)
+        restraint_force.addGlobalParameter('K_RMSD', 2*unit.kilocalories_per_mole/(unit.angstroms**2))
+        restraint_force.addGlobalParameter('RMSD0', 2*unit.angstroms)
+        reference_system.addForce(restraint_force)
 
         alchemical_system = self._alchemically_modify_ligand(reference_system)
 
@@ -451,41 +449,40 @@ class RocsaltSystem(object):
         compound_states.lambda_sterics_one = 0.0
         compound_states.lambda_electrostatics_one = 0.0
         compound_states.apply_to_context(context)
-        print('Annealing sterics...')
+        print('Annealing sterics of ligand 1...')
         for step in progressbar.progressbar(range(n_annealing_steps)):
             compound_states.lambda_sterics_zero = float(step) / float(n_annealing_steps)
             compound_states.lambda_electrostatics_zero = 0.0
             compound_states.apply_to_context(context)
             integrator.step(1)
-        print('Annealing electrostatics...')
+        print('Annealing electrostatics of ligand 1...')
         for step in progressbar.progressbar(range(n_annealing_steps)):
             compound_states.lambda_sterics_zero = 1.0
             compound_states.lambda_electrostatics_zero = float(step) / float(n_annealing_steps)
             compound_states.apply_to_context(context)
             integrator.step(1)
+        compound_states.lambda_sterics_zero = 1.0
+        compound_states.lambda_electrostatics_zero = 1.0
+        compound_states.apply_to_context(context)
+        print('Annealing sterics of ligand 2...')
+        for step in progressbar.progressbar(range(n_annealing_steps)):
+            compound_states.lambda_sterics_one = float(step) / float(n_annealing_steps)
+            compound_states.lambda_electrostatics_one = 0.0
+            compound_states.apply_to_context(context)
+            integrator.step(1)
+        print('Annealing electrostatics of ligand 2...')
+        for step in progressbar.progressbar(range(n_annealing_steps)):
+            compound_states.lambda_sterics_one = 1.0
+            compound_states.lambda_electrostatics_one = float(step) / float(n_annealing_steps)
+            compound_states.apply_to_context(context)
+            integrator.step(1)
+        compound_states.apply_to_context(context)
         sampler_state.update_from_context(context)
-
         # Compute the final energy of the system.
         final_energy = thermodynamic_state.reduced_potential(context)
         print('final alchemical energy {:8.3f}kT'.format(final_energy))
 
         return sampler_state.positions
-
-    def _modify_yaml(self):
-        """
-        Creates a Yank yaml configuration file
-        """
-
-        file_name = 'rocsalt_system.yaml'
-        config, ind, bsi = ruamel.yaml.util.load_yaml_guess_indent(open(file_name))
-        instances_system = config['systems']
-        instances_experiment = config['experiment']
-        instances_system['relative-system'][f'ligand_dsl'] = [[f'resname {self.ligands[0].name}'],
-                                                     [f'resname {self.ligands[1].name}']]
-        instances_experiment['restraint'][f'restrained_ligand_atoms'] =[[f'resname {self.ligands[0].name}'],
-                                                     [f'resname {self.ligands[1].name}']]
-        with open(file_name, 'w') as fp:
-            ruamel.yaml.round_trip_dump(config, fp,  default_flow_style=True )
 
 class _Ligand(object):
     """
@@ -540,8 +537,6 @@ class _Ligand(object):
         shutil.move(source_inpcrd, os.path.join(destination, os.path.basename(source_inpcrd)))
 
         return os.path.join(destination, os.path.basename(source_prmtop)), os.path.join(destination, os.path.basename(source_inpcrd))
-
-
 
 class _Phase(object):
     """
@@ -613,7 +608,16 @@ def main():
     with open('solvent_system.xml', 'w') as f:
          f.write(XmlSerializer.serialize(rocsalt.phases[1].system))
     # Write pdb
-    rocsalt.phases[0].structure.write_pdb('complex_phase.pdb')
+    coords = rocsalt.phases[0].structure.get_coordinates(frame=0)*unit.angstroms
+    xyz = np.zeros(shape=(1,coords.shape[0],3))
+    xyz[0,:,:] = coords.in_units_of(unit.nanometers)/unit.nanometers
+    cell_size = [rocsalt.phases[0].structure.box[i]*unit.angstroms for i in range(3)]
+    cell_angles = [rocsalt.phases[0].structure.box[i] for i in range(3,6)]
+    t = md.Trajectory(xyz, topology=rocsalt.phases[0].mdtraj_top, 
+                      unitcell_lengths=np.asarray([l.in_units_of(unit.nanometers)/unit.nanometers for l in cell_size]), 
+                      unitcell_angles=np.asarray([a for a in cell_angles]))
+    t.image_molecules(inplace=True)
+    t.save_pdb('complex_phase.pdb')
     rocsalt.phases[1].structure.write_pdb('solvent_phase.pdb')
 
     # Serialize ParmEd structure
@@ -621,8 +625,6 @@ def main():
         pickle.dump(rocsalt.phases[0].structure, file)
     with open('solvent_structure.pickle', 'wb') as file:
         pickle.dump(rocsalt.phases[1].structure, file)
-    # Edit yaml file
-    rocsalt._modify_yaml()
 
 if __name__ == "__main__":
 
