@@ -608,7 +608,7 @@ def main():
     with open('solvent_system.xml', 'w') as f:
          f.write(XmlSerializer.serialize(rocsalt.phases[1].system))
     # Write pdb
-    for index, phase in enumerate(['complex, solvent']):
+    for index, phase in enumerate(['complex', 'solvent']):
         coords = rocsalt.phases[index].structure.get_coordinates(frame=0)*unit.angstroms
         xyz = np.zeros(shape=(1,coords.shape[0],3))
         xyz[0,:,:] = coords.in_units_of(unit.nanometers)/unit.nanometers
